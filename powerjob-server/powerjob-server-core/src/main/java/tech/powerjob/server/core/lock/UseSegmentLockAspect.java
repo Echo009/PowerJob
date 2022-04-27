@@ -1,16 +1,21 @@
 package tech.powerjob.server.core.lock;
 
-import tech.powerjob.common.utils.SegmentLock;
-import org.springframework.core.annotation.Order;
-import tech.powerjob.server.common.utils.AOPUtils;
+import com.alibaba.fastjson.JSON;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.Maps;
 import lombok.extern.slf4j.Slf4j;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.aspectj.lang.annotation.Around;
 import org.aspectj.lang.annotation.Aspect;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
+import tech.powerjob.server.common.utils.AOPUtils;
 
+import java.lang.reflect.Method;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * aspect for @UseSegmentLock
@@ -24,22 +29,37 @@ import java.util.Map;
 @Order(1)
 public class UseSegmentLockAspect {
 
-    private final Map<String, SegmentLock> lockStore = Maps.newConcurrentMap();
+    private final Map<String, Cache<String, ReentrantLock>> lockContainer = Maps.newConcurrentMap();
+
+    private static final long SLOW_THRESHOLD = 500;
 
     @Around(value = "@annotation(useSegmentLock))")
     public Object execute(ProceedingJoinPoint point, UseSegmentLock useSegmentLock) throws Throwable {
-        SegmentLock segmentLock = lockStore.computeIfAbsent(useSegmentLock.type(), ignore -> {
+        Cache<String, ReentrantLock> lockCache = lockContainer.computeIfAbsent(useSegmentLock.type(), ignore -> {
             int concurrencyLevel = useSegmentLock.concurrencyLevel();
-            log.info("[UseSegmentLockAspect] create SegmentLock for [{}] with concurrencyLevel: {}", useSegmentLock.type(), concurrencyLevel);
-            return new SegmentLock(concurrencyLevel);
+            log.info("[UseSegmentLockAspect] create Lock Cache for [{}] with concurrencyLevel: {}", useSegmentLock.type(), concurrencyLevel);
+            return CacheBuilder.newBuilder()
+                    .initialCapacity(300000)
+                    .maximumSize(500000)
+                    .concurrencyLevel(concurrencyLevel)
+                    .expireAfterWrite(10, TimeUnit.MINUTES)
+                    .build();
         });
-
-        int index = AOPUtils.parseSpEl(AOPUtils.parseMethod(point), point.getArgs(), useSegmentLock.key(), Integer.class, 1);
+        final Method method = AOPUtils.parseMethod(point);
+        Long key = AOPUtils.parseSpEl(method, point.getArgs(), useSegmentLock.key(), Long.class, 1L);
+        final ReentrantLock reentrantLock = lockCache.get(String.valueOf(key), ReentrantLock::new);
+        long start = System.currentTimeMillis();
+        reentrantLock.lockInterruptibly();
         try {
-            segmentLock.lockInterruptibleSafe(index);
+            long timeCost = System.currentTimeMillis() - start;
+            if (timeCost > SLOW_THRESHOLD) {
+                log.warn("[UseSegmentLockAspect] wait lock for method({}#{}) cost {} ms! key = '{}', args = {}, ", method.getDeclaringClass().getSimpleName(), method.getName(), timeCost,
+                        useSegmentLock.key(),
+                        JSON.toJSONString(point.getArgs()));
+            }
             return point.proceed();
         } finally {
-            segmentLock.unlock(index);
+            reentrantLock.unlock();
         }
     }
 }

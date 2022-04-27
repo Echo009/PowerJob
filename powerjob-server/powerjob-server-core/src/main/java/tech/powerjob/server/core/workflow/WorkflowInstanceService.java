@@ -74,7 +74,7 @@ public class WorkflowInstanceService {
      * @param appId        所属应用ID
      */
     @DesignateServer
-    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId.intValue()", concurrencyLevel = 1024)
+    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId", concurrencyLevel = 1024)
     public void stopWorkflowInstance(Long wfInstanceId, Long appId) {
         WorkflowInstanceInfoDO wfInstance = fetchWfInstance(wfInstanceId, appId);
         if (!WorkflowInstanceStatus.GENERALIZED_RUNNING_STATUS.contains(wfInstance.getStatus())) {
@@ -120,7 +120,7 @@ public class WorkflowInstanceService {
      * @param appId        应用ID
      */
     @DesignateServer
-    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId.intValue()", concurrencyLevel = 1024)
+    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId", concurrencyLevel = 1024)
     public void retryWorkflowInstance(Long wfInstanceId, Long appId) {
         WorkflowInstanceInfoDO wfInstance = fetchWfInstance(wfInstanceId, appId);
         // 仅允许重试 失败的工作流
@@ -189,7 +189,7 @@ public class WorkflowInstanceService {
      * @param nodeId       节点 ID
      */
     @DesignateServer
-    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId.intValue()", concurrencyLevel = 1024)
+    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId", concurrencyLevel = 1024)
     public void markNodeAsSuccess(Long appId, Long wfInstanceId, Long nodeId) {
 
         WorkflowInstanceInfoDO wfInstance = fetchWfInstance(wfInstanceId, appId);

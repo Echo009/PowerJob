@@ -200,7 +200,7 @@ public class WorkflowInstanceManager {
      * @param wfInfo       工作流任务信息
      * @param wfInstanceId 工作流任务实例ID
      */
-    @UseSegmentLock(type = "startWfInstance", key = "#wfInfo.getId().intValue()", concurrencyLevel = 1024)
+    @UseSegmentLock(type = "processWfInstance", key = "#wfInfo.getMaxWfInstanceNum() > 0 ? #wfInfo.getId() : #wfInstanceId", concurrencyLevel = 1024)
     public void start(WorkflowInfoDO wfInfo, Long wfInstanceId) {
 
         Optional<WorkflowInstanceInfoDO> wfInstanceInfoOpt = workflowInstanceInfoRepository.findByWfInstanceId(wfInstanceId);
@@ -272,7 +272,7 @@ public class WorkflowInstanceManager {
      * @param result       完成任务的任务实例结果
      */
     @SuppressWarnings({"squid:S3776", "squid:S2142", "squid:S1141"})
-    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId.intValue()", concurrencyLevel = 1024)
+    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId", concurrencyLevel = 1024)
     public void move(Long wfInstanceId, Long instanceId, InstanceStatus status, String result) {
 
         Optional<WorkflowInstanceInfoDO> wfInstanceInfoOpt = workflowInstanceInfoRepository.findByWfInstanceId(wfInstanceId);
@@ -386,7 +386,7 @@ public class WorkflowInstanceManager {
      * @param appendedWfContextData 追加的上下文数据
      * @since 2021/02/05
      */
-    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId.intValue()", concurrencyLevel = 1024)
+    @UseSegmentLock(type = "processWfInstance", key = "#wfInstanceId", concurrencyLevel = 1024)
     public void updateWorkflowContext(Long wfInstanceId, Map<String, String> appendedWfContextData) {
 
         try {
