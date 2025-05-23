@@ -7,9 +7,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.BeanUtils;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.CollectionUtils;
 import tech.powerjob.common.PowerQuery;
 import tech.powerjob.common.enums.InstanceStatus;
+import tech.powerjob.common.enums.SwitchableStatus;
 import tech.powerjob.common.enums.TimeExpressionType;
 import tech.powerjob.common.exception.PowerJobException;
 import tech.powerjob.common.model.AlarmConfig;
@@ -18,7 +20,6 @@ import tech.powerjob.common.request.http.SaveJobInfoRequest;
 import tech.powerjob.common.response.JobInfoDTO;
 import tech.powerjob.common.serialize.JsonUtils;
 import tech.powerjob.server.common.SJ;
-import tech.powerjob.common.enums.SwitchableStatus;
 import tech.powerjob.server.common.timewheel.holder.InstanceTimeWheelService;
 import tech.powerjob.server.core.DispatchService;
 import tech.powerjob.server.core.instance.InstanceService;
@@ -90,7 +91,7 @@ public class JobServiceImpl implements JobService {
 
         // 转化报警用户列表
         if (request.getNotifyUserIds() != null) {
-            if (request.getNotifyUserIds().size() == 0) {
+            if (request.getNotifyUserIds().isEmpty()) {
                 jobInfoDO.setNotifyUserIds(null);
             } else {
                 jobInfoDO.setNotifyUserIds(SJ.COMMA_JOINER.join(request.getNotifyUserIds()));
@@ -188,14 +189,67 @@ public class JobServiceImpl implements JobService {
         final InstanceInfoDO instanceInfo = instanceService.create(jobInfo.getId(), jobInfo.getAppId(), jobInfo.getJobParams(), instanceParams, null, System.currentTimeMillis() + Math.max(delay, 0));
         instanceInfoRepository.flush();
         if (delay <= 0) {
-            dispatchService.dispatch(jobInfo, instanceInfo.getInstanceId(), Optional.of(instanceInfo),Optional.empty());
+            dispatchService.dispatch(jobInfo, instanceInfo.getInstanceId(), Optional.of(instanceInfo), Optional.empty());
         } else {
-            InstanceTimeWheelService.schedule(instanceInfo.getInstanceId(), delay, () -> dispatchService.dispatch(jobInfo, instanceInfo.getInstanceId(), Optional.empty(),Optional.empty()));
+            InstanceTimeWheelService.schedule(instanceInfo.getInstanceId(), delay, () -> dispatchService.dispatch(jobInfo, instanceInfo.getInstanceId(), Optional.empty(), Optional.empty()));
         }
         log.info("[Job-{}|{}] execute 'runJob' successfully, params={}", jobInfo.getId(), instanceInfo.getInstanceId(), instanceParams);
         return instanceInfo.getInstanceId();
     }
 
+    /**
+     * 原子化调度任务（保证创建任务实例和刷新下次调度时间的原子性）
+     *
+     * @param jobInfo            任务信息
+     * @param timeExpressionType 时间表达式类型
+     */
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void atomicScheduleJob(JobInfoDO jobInfo, TimeExpressionType timeExpressionType) {
+        log.info("[Job-{}] try to schedule job: {}", jobInfo.getId(), jobInfo);
+
+        try {
+            // 1. 创建任务实例
+            InstanceInfoDO instanceInfo = instanceService.create(jobInfo.getId(), jobInfo.getAppId(), jobInfo.getJobParams(), null, jobInfo.getNextTriggerTime(), System.currentTimeMillis());
+            instanceInfoRepository.flush();
+
+            // 2. 计算下次调度时间并更新任务表
+            LifeCycle lifeCycle = LifeCycle.parse(jobInfo.getLifecycle());
+            Long nextTriggerTime = timingStrategyService.calculateNextTriggerTime(jobInfo.getNextTriggerTime(), timeExpressionType, jobInfo.getTimeExpression(), lifeCycle.getStart(), lifeCycle.getEnd());
+
+            JobInfoDO updatedJobInfo = new JobInfoDO();
+            BeanUtils.copyProperties(jobInfo, updatedJobInfo);
+
+            if (nextTriggerTime == null) {
+                log.warn("[Job-{}] this job won't be scheduled anymore, system will set the status to DISABLE!", jobInfo.getId());
+                updatedJobInfo.setStatus(SwitchableStatus.DISABLE.getV());
+            } else {
+                updatedJobInfo.setNextTriggerTime(nextTriggerTime);
+            }
+            updatedJobInfo.setGmtModified(new Date());
+            jobInfoRepository.save(updatedJobInfo);
+            jobInfoRepository.flush();
+
+            // 3. 推入时间轮，准备调度执行
+            long delay = jobInfo.getNextTriggerTime() - System.currentTimeMillis();
+            if (delay < 0) {
+                log.warn("[Job-{}] job schedule delay, expect:{}, actual: {}", jobInfo.getId(), jobInfo.getNextTriggerTime(), System.currentTimeMillis());
+                delay = 0;
+            }
+            if (delay == 0) {
+                dispatchService.dispatch(jobInfo, instanceInfo.getInstanceId(), Optional.of(instanceInfo), Optional.empty());
+            } else {
+                InstanceTimeWheelService.schedule(instanceInfo.getInstanceId(), delay, () ->
+                        dispatchService.dispatch(jobInfo, instanceInfo.getInstanceId(), Optional.empty(), Optional.empty())
+                );
+            }
+
+            log.info("[Job-{}|{}] schedule job successfully, nextTriggerTime: {}", jobInfo.getId(), instanceInfo.getInstanceId(), nextTriggerTime);
+        } catch (Exception e) {
+            log.error("[Job-{}] schedule job failed.", jobInfo.getId(), e);
+            throw e;
+        }
+    }
 
     /**
      * 删除某个任务
@@ -217,6 +271,7 @@ public class JobServiceImpl implements JobService {
 
     /**
      * 导出某个任务为 JSON
+     *
      * @param jobId jobId
      * @return 导出结果
      */

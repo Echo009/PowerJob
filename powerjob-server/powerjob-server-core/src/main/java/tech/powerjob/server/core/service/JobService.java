@@ -1,6 +1,7 @@
 package tech.powerjob.server.core.service;
 
 import tech.powerjob.common.PowerQuery;
+import tech.powerjob.common.enums.TimeExpressionType;
 import tech.powerjob.common.request.http.SaveJobInfoRequest;
 import tech.powerjob.common.response.JobInfoDTO;
 import tech.powerjob.server.persistence.remote.model.JobInfoDO;
@@ -34,4 +35,12 @@ public interface JobService {
     void enableJob(Long jobId);
 
     SaveJobInfoRequest exportJob(Long jobId);
+
+    /**
+     * 原子化调度任务（保证创建任务实例和刷新下次调度时间的原子性）
+     *
+     * @param jobInfo            任务信息
+     * @param timeExpressionType 时间表达式类型
+     */
+    void atomicScheduleJob(JobInfoDO jobInfo, TimeExpressionType timeExpressionType);
 }

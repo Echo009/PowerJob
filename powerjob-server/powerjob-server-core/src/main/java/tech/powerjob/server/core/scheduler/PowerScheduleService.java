@@ -1,22 +1,17 @@
 package tech.powerjob.server.core.scheduler;
 
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.BeanUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
 import tech.powerjob.common.enums.InstanceStatus;
+import tech.powerjob.common.enums.SwitchableStatus;
 import tech.powerjob.common.enums.TimeExpressionType;
 import tech.powerjob.common.model.LifeCycle;
-import tech.powerjob.common.enums.SwitchableStatus;
-import tech.powerjob.server.common.timewheel.holder.InstanceTimeWheelService;
-import tech.powerjob.server.core.DispatchService;
-import tech.powerjob.server.core.instance.InstanceService;
 import tech.powerjob.server.core.service.JobService;
-import tech.powerjob.server.core.workflow.WorkflowInstanceManager;
+import tech.powerjob.server.core.service.WorkflowService;
 import tech.powerjob.server.persistence.remote.model.JobInfoDO;
 import tech.powerjob.server.persistence.remote.model.WorkflowInfoDO;
 import tech.powerjob.server.persistence.remote.repository.AppInfoRepository;
@@ -26,7 +21,10 @@ import tech.powerjob.server.persistence.remote.repository.WorkflowInfoRepository
 import tech.powerjob.server.remote.transporter.TransportService;
 import tech.powerjob.server.remote.worker.WorkerClusterManagerService;
 
-import java.util.*;
+import java.util.Date;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 
 /**
  * 任务调度执行服务（调度 CRON 表达式的任务进行执行）
@@ -47,11 +45,6 @@ public class PowerScheduleService {
     private static final int MAX_APP_NUM = 10;
 
     private final TransportService transportService;
-    private final DispatchService dispatchService;
-
-    private final InstanceService instanceService;
-
-    private final WorkflowInstanceManager workflowInstanceManager;
 
     private final AppInfoRepository appInfoRepository;
 
@@ -63,7 +56,7 @@ public class PowerScheduleService {
 
     private final JobService jobService;
 
-    private final TimingStrategyService timingStrategyService;
+    private final WorkflowService workflowService;
 
     public static final long SCHEDULE_RATE = 15000;
 
@@ -144,8 +137,9 @@ public class PowerScheduleService {
 
     /**
      * 调度普通服务端计算表达式类型（CRON、DAILY_TIME_INTERVAL）的任务
+     *
      * @param timeExpressionType 表达式类型
-     * @param appIds appIds
+     * @param appIds             appIds
      */
     private void scheduleNormalJob0(TimeExpressionType timeExpressionType, List<Long> appIds) {
 
@@ -162,42 +156,16 @@ public class PowerScheduleService {
                     return;
                 }
 
-                // 1. 批量写日志表
-                Map<Long, Long> jobId2InstanceId = Maps.newHashMap();
                 log.info("[NormalScheduler] These {} jobs will be scheduled: {}.", timeExpressionType.name(), jobInfos);
 
-                jobInfos.forEach(jobInfo -> {
-                    Long instanceId = instanceService.create(jobInfo.getId(), jobInfo.getAppId(), jobInfo.getJobParams(), null, null, jobInfo.getNextTriggerTime()).getInstanceId();
-                    jobId2InstanceId.put(jobInfo.getId(), instanceId);
-                });
-                instanceInfoRepository.flush();
-
-                // 2. 推入时间轮中等待调度执行
-                jobInfos.forEach(jobInfoDO -> {
-
-                    Long instanceId = jobId2InstanceId.get(jobInfoDO.getId());
-
-                    long targetTriggerTime = jobInfoDO.getNextTriggerTime();
-                    long delay = 0;
-                    if (targetTriggerTime < nowTime) {
-                        log.warn("[Job-{}] schedule delay, expect: {}, current: {}", jobInfoDO.getId(), targetTriggerTime, System.currentTimeMillis());
-                    } else {
-                        delay = targetTriggerTime - nowTime;
-                    }
-
-                    InstanceTimeWheelService.schedule(instanceId, delay, () -> dispatchService.dispatch(jobInfoDO, instanceId, Optional.empty(), Optional.empty()));
-                });
-
-                // 3. 计算下一次调度时间（忽略5S内的重复执行，即CRON模式下最小的连续执行间隔为 SCHEDULE_RATE ms）
-                jobInfos.forEach(jobInfoDO -> {
+                for (JobInfoDO jobInfoDO : jobInfos) {
                     try {
-                        refreshJob(timeExpressionType, jobInfoDO);
+                        // 使用事务保证以下操作的原子性
+                        jobService.atomicScheduleJob(jobInfoDO, timeExpressionType);
                     } catch (Exception e) {
-                        log.error("[Job-{}] refresh job failed.", jobInfoDO.getId(), e);
+                        log.error("[Job-{}] schedule job failed.", jobInfoDO.getId(), e);
                     }
-                });
-                jobInfoRepository.flush();
-
+                }
 
             } catch (Exception e) {
                 log.error("[NormalScheduler] schedule {} job failed.", timeExpressionType.name(), e);
@@ -217,23 +185,10 @@ public class PowerScheduleService {
             }
 
             wfInfos.forEach(wfInfo -> {
-
-                // 1. 先生成调度记录，防止不调度的情况发生
-                Long wfInstanceId = workflowInstanceManager.create(wfInfo, null, wfInfo.getNextTriggerTime(), null);
-
-                // 2. 推入时间轮，准备调度执行
-                long delay = wfInfo.getNextTriggerTime() - System.currentTimeMillis();
-                if (delay < 0) {
-                    log.warn("[Workflow-{}] workflow schedule delay, expect:{}, actual: {}", wfInfo.getId(), wfInfo.getNextTriggerTime(), System.currentTimeMillis());
-                    delay = 0;
-                }
-                InstanceTimeWheelService.schedule(wfInstanceId, delay, () -> workflowInstanceManager.start(wfInfo, wfInstanceId));
-
-                // 3. 重新计算下一次调度时间并更新
                 try {
-                    refreshWorkflow(wfInfo);
+                    workflowService.atomicScheduleWorkflow(wfInfo);
                 } catch (Exception e) {
-                    log.error("[Workflow-{}] refresh workflow failed.", wfInfo.getId(), e);
+                    log.error("[Workflow-{}] schedule workflow failed.", wfInfo.getId(), e);
                 }
             });
             workflowInfoRepository.flush();
@@ -284,42 +239,6 @@ public class PowerScheduleService {
                 log.error("[FrequentScheduler] schedule frequent job failed.", e);
             }
         });
-    }
-
-    private void refreshJob(TimeExpressionType timeExpressionType, JobInfoDO jobInfo) {
-        LifeCycle lifeCycle = LifeCycle.parse(jobInfo.getLifecycle());
-        Long nextTriggerTime = timingStrategyService.calculateNextTriggerTime(jobInfo.getNextTriggerTime(), timeExpressionType, jobInfo.getTimeExpression(), lifeCycle.getStart(), lifeCycle.getEnd());
-
-        JobInfoDO updatedJobInfo = new JobInfoDO();
-        BeanUtils.copyProperties(jobInfo, updatedJobInfo);
-
-        if (nextTriggerTime == null) {
-            log.warn("[Job-{}] this job won't be scheduled anymore, system will set the status to DISABLE!", jobInfo.getId());
-            updatedJobInfo.setStatus(SwitchableStatus.DISABLE.getV());
-        } else {
-            updatedJobInfo.setNextTriggerTime(nextTriggerTime);
-        }
-        updatedJobInfo.setGmtModified(new Date());
-
-        jobInfoRepository.save(updatedJobInfo);
-    }
-
-    private void refreshWorkflow(WorkflowInfoDO wfInfo) {
-        LifeCycle lifeCycle = LifeCycle.parse(wfInfo.getLifecycle());
-        Long nextTriggerTime = timingStrategyService.calculateNextTriggerTime(wfInfo.getNextTriggerTime(), TimeExpressionType.CRON, wfInfo.getTimeExpression(), lifeCycle.getStart(), lifeCycle.getEnd());
-
-        WorkflowInfoDO updateEntity = new WorkflowInfoDO();
-        BeanUtils.copyProperties(wfInfo, updateEntity);
-
-        if (nextTriggerTime == null) {
-            log.warn("[Workflow-{}] this workflow won't be scheduled anymore, system will set the status to DISABLE!", wfInfo.getId());
-            updateEntity.setStatus(SwitchableStatus.DISABLE.getV());
-        } else {
-            updateEntity.setNextTriggerTime(nextTriggerTime);
-        }
-
-        updateEntity.setGmtModified(new Date());
-        workflowInfoRepository.save(updateEntity);
     }
 
 }
